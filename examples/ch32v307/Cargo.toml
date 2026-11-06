@@ -43,11 +43,18 @@ embedded-hal = "1.0.0"
 usb-dfu-target = "0.1.0"
 
 # for eth
-embassy-net = { version = "0.9.1", features = ["tcp", "dhcpv4", "medium-ethernet", "proto-ipv4"] }
+embassy-net = { version = "0.9.1", features = ["tcp", "udp", "dhcpv4", "medium-ethernet", "proto-ipv4"] }
 embassy-net-driver = "0.2.0"
 static_cell = "2.1"
 embedded-io-async = "0.7"
 portable-atomic = { version = "1", features = ["critical-section"] }
+
+# for eth_bench
+embassy-sync = "0.7"
+embedded-websocket = { version = "0.9.5", default-features = false }
+httparse = { version = "1.9", default-features = false }
+rand_core = "0.6.3"
+heapless = "0.8"
 
 [profile.release]
 strip = false   # symbols are not flashed to the microcontroller, so don't strip them.

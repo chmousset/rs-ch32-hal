@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>CH32 WS bench</title>
+<style>
+body{font:14px system-ui,sans-serif;margin:12px;max-width:760px}
+table{border-collapse:collapse}td{padding:2px 10px 2px 0}td:nth-child(2){text-align:right;font-variant-numeric:tabular-nums;min-width:8em}
+input{width:6em}canvas{width:100%;height:160px;background:#111;margin-top:8px}
+#st{font-weight:bold}
+</style>
+</head>
+<body>
+<h3>CH32V307 WebSocket bench <span id="st">…</span></h3>
+<div>
+period µs <input id="p" type="number" value="10000">
+samples <input id="n" type="number" value="64">
+nagle <input id="g" type="checkbox" checked>
+<button id="apply">apply</button>
+<button id="rst">reset stats</button>
+<label><input id="sc" type="checkbox" checked> scope</label>
+</div>
+<table id="t"></table>
+<p>Skipped frames were generated but not sent to this client when it could not keep up.
+Sequence gaps and the device counter report this skipping; the counts are not additive
+and do not measure TCP packet loss.</p>
+<canvas id="c" width="720" height="160"></canvas>
+<script>
+"use strict";
+// ws://<host>/ws ; override with ?ws=host[:port] when the page is served elsewhere
+const host = new URLSearchParams(location.search).get("ws") || location.host;
+const $ = id => document.getElementById(id);
+let ws, s, last, win, cfg = {};
+const reset = () => {
+  s = {frames: 0, bytes: 0, gaps: 0, lag0: null, lag: 0, t0: performance.now()};
+  last = null; win = newWin();
+};
+const newWin = () => ({t: performance.now(), frames: 0, bytes: 0, iaMin: 1e9, iaMax: 0, dev: 0, devN: 0});
+reset();
+let samples = null, rates = {fps: 0, kBps: 0, iaMin: 0, iaMax: 0, devP: 0};
+
+function connect() {
+  ws = new WebSocket("ws://" + host + "/ws");
+  ws.binaryType = "arraybuffer";
+  $("st").textContent = "connecting";
+  ws.onopen = () => { $("st").textContent = "open"; reset(); };
+  ws.onclose = () => { $("st").textContent = "closed, retrying"; setTimeout(connect, 1000); };
+  ws.onmessage = ev => {
+    if (typeof ev.data === "string") {
+      cfg = JSON.parse(ev.data);
+      $("p").value = cfg.period_us; $("n").value = cfg.n; $("g").checked = !!cfg.nagle;
+      return;
+    }
+    const now = performance.now(), b = ev.data, v = new DataView(b);
+    const n = v.getUint16(2, true), seq = v.getUint32(4, true), t = v.getUint32(8, true), lag = v.getUint32(12, true);
+    if (last) {
+      s.gaps += ((seq - last.seq) >>> 0) - 1;
+      const ia = now - last.now;
+      if (ia < win.iaMin) win.iaMin = ia;
+      if (ia > win.iaMax) win.iaMax = ia;
+      win.dev += ((t - last.t) >>> 0); win.devN++;
+    }
+    if (s.lag0 === null) s.lag0 = lag;
+    s.lag = lag - s.lag0;
+    last = {seq, t, now};
+    s.frames++; s.bytes += b.byteLength; win.frames++; win.bytes += b.byteLength;
+    if ($("sc").checked) samples = new Uint16Array(b, 16, n);
+  };
+}
+
+$("apply").onclick = () => ws && ws.readyState === 1 &&
+  ws.send(`cfg ${$("p").value} ${$("n").value} ${$("g").checked ? 1 : 0}`);
+$("rst").onclick = reset;
+
+// 1 s statistics window
+setInterval(() => {
+  const now = performance.now(), dt = (now - win.t) / 1000;
+  rates = {fps: win.frames / dt, kBps: win.bytes / dt / 1000,
+           iaMin: win.frames > 1 ? win.iaMin : 0, iaMax: win.iaMax,
+           devP: win.devN ? win.dev / win.devN : 0};
+  win = newWin();
+  const exp = s.frames + s.gaps;
+  const rows = [
+    ["frames received", s.frames],
+    ["skipped frames (sequence gaps)", s.gaps + " (" + (exp ? (100 * s.gaps / exp).toFixed(2) : "0.00") + " %)"],
+    ["skipped frames (device counter)", s.lag],
+    ["rate", rates.fps.toFixed(0) + " frames/s"],
+    ["throughput", rates.kBps.toFixed(1) + " kB/s (" + (rates.kBps * 8 / 1000).toFixed(2) + " Mbit/s)"],
+    ["configured period", (cfg.period_us || 0) + " µs"],
+    ["device period (avg)", (rates.devP / 1000).toFixed(3) + " ms"],
+    ["inter-arrival min/max", rates.iaMin.toFixed(2) + " / " + rates.iaMax.toFixed(2) + " ms"],
+    ["total received", (s.bytes / 1e6).toFixed(2) + " MB"],
+    ["uptime", ((now - s.t0) / 1000).toFixed(0) + " s"],
+  ];
+  $("t").innerHTML = rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join("");
+}, 1000);
+
+// scope: redraw at most once per animation frame
+const c = $("c"), g = c.getContext("2d");
+(function draw() {
+  if (samples && $("sc").checked) {
+    g.clearRect(0, 0, c.width, c.height);
+    g.strokeStyle = "#3f3"; g.beginPath();
+    const k = c.width / Math.max(samples.length - 1, 1);
+    for (let i = 0; i < samples.length; i++) {
+      const y = c.height - samples[i] / 4096 * c.height;
+      i ? g.lineTo(i * k, y) : g.moveTo(0, y);
+    }
+    g.stroke(); samples = null;
+  }
+  requestAnimationFrame(draw);
+})();
+connect();
+</script>
+</body>
+</html>
