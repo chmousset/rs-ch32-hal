@@ -21,6 +21,9 @@ use embassy_usb::driver::{Direction, EndpointAddress, EndpointError, EndpointIn,
 use embassy_usb::Builder;
 use panic_halt as _;
 
+// Every transaction is NAKed until the USBHS interrupt has run: keep it at the highest
+// priority and critical sections short (see "Interrupt latency" in `ch32_hal::usbhs`). An interrupt OUT polled
+// right after an IN is the first to suffer.
 bind_interrupts!(struct Irq {
     USBHS => InterruptHandler<peripherals::USBHS>;
     USBHS_WKUP => WakeupInterruptHandler<peripherals::USBHS>;

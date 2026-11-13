@@ -166,6 +166,9 @@ impl<'d, T: Instance, const SIZE: usize> EndpointIn for Endpoint<'d, T, In, SIZE
         let d = T::dregs();
         critical_section::with(|_| {
             s.armed.store(true, Ordering::Relaxed);
+            // may drop an RX auto-toggle flip of this endpoint number's OUT side, if one
+            // completes in the same cycle; the interrupt detects and corrects it
+            // (README.md section 2)
             d.ep_t_len(index).write(|v| v.set_len(buf.len() as u16));
             d.ep_tx_ctrl(index).modify(|v| v.set_mask_uep_t_res(EpTxResponse::ACK));
         });

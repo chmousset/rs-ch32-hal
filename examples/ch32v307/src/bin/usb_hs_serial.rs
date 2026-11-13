@@ -12,6 +12,8 @@ use embassy_usb::Builder;
 use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
 use embassy_usb::driver::EndpointError;
 
+// Every transaction is NAKed until the USBHS interrupt has run: keep it at the highest
+// priority and critical sections short (see "Interrupt latency" in `ch32_hal::usbhs`).
 bind_interrupts!(struct Irq {
     USBHS => InterruptHandler<peripherals::USBHS>;
     USBHS_WKUP => WakeupInterruptHandler<peripherals::USBHS>;

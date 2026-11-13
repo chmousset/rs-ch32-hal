@@ -29,6 +29,48 @@
 //! Isochronous and bulk / interrupt endpoints must use different numbers: a PING to a bulk
 //! OUT whose number is isochronous on the IN side hangs the SIE.
 //!
+//! # Interrupt latency
+//!
+//! While a completed transaction waits for the interrupt handler, the controller answers
+//! NAK to every token on every endpoint (it has a single status register, held by
+//! `INT_BUSY`). The handler releases it within a few instructions, so the time that counts
+//! is how long the USBHS interrupt waits before it runs: higher-priority interrupts,
+//! critical sections, and anything else that masks interrupts.
+//!
+//! Latency never corrupts or loses data, but it costs:
+//! - **Bandwidth.** Every token that arrives during the wait is NAKed and retried by the host,
+//!   so bulk throughput drops as latency grows.
+//! - **Interrupt OUT endpoints.** At high speed the host often polls an interrupt OUT right
+//!   after an IN in the same microframe. If the interrupt for that IN is about 2 us late or
+//!   more, every poll is NAKed, and no OUT data gets through for as long as that lasts.
+//! - **A small risk of duplicates.** A bulk / interrupt OUT packet is accepted from its data
+//!   toggle. When the handler runs more than about one packet time late (~10 us at high
+//!   speed, ~50 us at full speed), the controller's toggle-match status is no longer usable
+//!   and the packet is taken as new. If, in that same window, the host was retransmitting a
+//!   packet because it missed the device's ACK (a bus error), that packet is delivered twice.
+//!   The second count of [`lost_toggle_flips`] tells how often a packet was accepted this way.
+//!
+//! To stay clear of all three:
+//! - Keep the USBHS interrupt at the highest priority used in the application, or make sure
+//!   higher-priority handlers are short.
+//! - Keep critical sections and interrupt-masked regions to a few microseconds.
+//! - Keep the [`set_sof_callback`] function short: it runs inside the USBHS interrupt, every
+//!   125 us at high speed.
+//!
+//! # Diagnostics
+//!
+//! [`lost_toggle_flips`] returns two counters:
+//! - Lost toggle flips that were detected and corrected. The controller sometimes drops the
+//!   data-toggle update of an OUT packet when the IN side of the same endpoint number is
+//!   written at the same moment (a silicon behaviour). The driver repairs it, so a slowly
+//!   growing count is normal when IN and OUT share an endpoint number, and harmless.
+//! - OUT packets accepted without a usable toggle status, as described under
+//!   [Interrupt latency](#interrupt-latency). It stays at 0 when the interrupt is served
+//!   promptly. If it grows, look for what delays the USBHS interrupt.
+//!
+//! Implementation notes for maintainers (controller behaviour measured on hardware, and why
+//! the interrupt handler is written as it is) are in `src/usbhs/README.md` in the repository.
+//!
 //! Not supported: remote wakeup, high-bandwidth isochronous (more than one transaction per
 //! microframe), hardware double buffering, full-speed operation (the block is configured
 //! for high speed).
@@ -418,9 +460,10 @@ fn iso_in_complete(d: crate::pac::usbhs::Usbd, ep: usize) {
 fn nak_non_iso(d: crate::pac::usbhs::Usbd, st: ch32_metapac::usbhs::regs::IntSt) {
     let ep = st.endp() as usize;
     match st.token() {
-        // bulk / interrupt: before knowing whether a packet went through (`toggled`), so the
-        // next can't land on it
-        UsbToken::OUT if (ep == 0 && st.tog_ok()) || (ep != 0 && !OUT_STATE[ep].iso.load(Ordering::Relaxed)) => {
+        // before the release, whether or not a new packet went through: once released, the
+        // host's next one lands within microseconds. EP0 too, whatever TOG_OK says (it
+        // describes any OUT NAKed since)
+        UsbToken::OUT if ep == 0 || !OUT_STATE[ep].iso.load(Ordering::Relaxed) => {
             d.ep_rx_ctrl(ep).modify(|w| w.set_mask_uep_r_res(EpRxResponse::NAK))
         }
         UsbToken::IN if !IN_STATE[ep].iso.load(Ordering::Relaxed) => {
@@ -430,32 +473,79 @@ fn nak_non_iso(d: crate::pac::usbhs::Usbd, st: ch32_metapac::usbhs::regs::IntSt)
     }
 }
 
-/// A packet went through a bulk / interrupt endpoint (not EP0): the SIE flips its toggle on
-/// each one it accepts (OUT) or the host ACKs (IN). INT_ST's TOG_OK can't tell: the flag comes
-/// a little before the SIE goes free, and an entry that early reads it before it's final.
-/// Waits for the SIE. The entry NAKed the endpoint; a read / write still waiting gets it back.
-fn toggled(r: crate::pac::usbhs::Usb, d: crate::pac::usbhs::Usbd, ep: usize, dir: Direction) -> bool {
-    let mut n = 0;
-    while !r.mis_st().read().sie_free() && n < SIE_WAIT {
-        n += 1;
+/// A packet went through a bulk / interrupt endpoint (not EP0): the SIE flips its toggle (auto
+/// toggle) on each one it accepts (OUT, expected PID) or the host ACKs (IN), and only then; the
+/// flip is visible when the flag is. With INT_BUSY at most one packet goes through per flag.
+/// The entry NAKed the endpoint; a read / write still waiting gets it back.
+fn toggled(d: crate::pac::usbhs::Usbd, ep: usize, dir: Direction) -> bool {
+    if flipped(d, ep, dir) {
+        return true;
     }
+    rearm_if_waiting(d, ep, dir);
+    false
+}
+
+/// Whether the toggle moved since the last accepted packet (and if so, take it). No side
+/// effect on the endpoint otherwise.
+fn flipped(d: crate::pac::usbhs::Usbd, ep: usize, dir: Direction) -> bool {
     let (s, tog) = match dir {
         Direction::Out => (&OUT_STATE[ep], d.ep_rx_ctrl(ep).read().mask_uep_r_tog()),
         Direction::In => (&IN_STATE[ep], d.ep_tx_ctrl(ep).read().mask_uep_t_tog()),
     };
     let tog = tog == EpTog::DATA1;
     if s.tog.load(Ordering::Relaxed) == tog {
-        if s.armed.load(Ordering::Relaxed) {
-            match dir {
-                Direction::Out => d.ep_rx_ctrl(ep).modify(|w| w.set_mask_uep_r_res(EpRxResponse::ACK)),
-                Direction::In => d.ep_tx_ctrl(ep).modify(|w| w.set_mask_uep_t_res(EpTxResponse::ACK)),
-            }
-        }
         return false;
     }
     s.tog.store(tog, Ordering::Relaxed);
     s.armed.store(false, Ordering::Relaxed);
     true
+}
+
+/// No new packet: the entry NAKed the endpoint; a read / write still waiting gets it back.
+fn rearm_if_waiting(d: crate::pac::usbhs::Usbd, ep: usize, dir: Direction) {
+    let s = match dir {
+        Direction::Out => &OUT_STATE[ep],
+        Direction::In => &IN_STATE[ep],
+    };
+    if s.armed.load(Ordering::Relaxed) {
+        match dir {
+            Direction::Out => d.ep_rx_ctrl(ep).modify(|w| w.set_mask_uep_r_res(EpRxResponse::ACK)),
+            Direction::In => d.ep_tx_ctrl(ep).modify(|w| w.set_mask_uep_t_res(EpTxResponse::ACK)),
+        }
+    }
+}
+
+/// OUT counterpart of `toggled`. No flip means a retransmit (the host missed our ACK) -- or a
+/// flip the SIE lost to a CPU write to this endpoint's T_LEN / TX_CTRL in the same cycle (see
+/// README.md section 2). TOG_OK tells which while no OUT was NAKed since the packet (IS_NAK clear);
+/// with IS_NAK set it describes that later packet, and a lost flip being far likelier than a
+/// bus error, the packet is taken as new. A lost flip is corrected here. Decision table:
+/// README.md section 4.
+fn out_accepted(d: crate::pac::usbhs::Usbd, ep: usize, st: ch32_metapac::usbhs::regs::IntSt) -> bool {
+    if flipped(d, ep, Direction::Out) {
+        return true;
+    }
+    if st.tog_ok() || st.is_nak() {
+        let counter = if st.is_nak() { &OUT_AMBIGUOUS } else { &LOST_FLIPS };
+        counter.store(counter.load(Ordering::Relaxed).wrapping_add(1), Ordering::Relaxed);
+        let s = &OUT_STATE[ep];
+        // the endpoint is NAKed: this write can't race an RX flip
+        d.ep_rx_ctrl(ep).modify(|w| w.set_mask_uep_r_tog(flip(w.mask_uep_r_tog())));
+        s.tog.store(!s.tog.load(Ordering::Relaxed), Ordering::Relaxed);
+        s.armed.store(false, Ordering::Relaxed);
+        return true;
+    }
+    rearm_if_waiting(d, ep, Direction::Out);
+    false
+}
+
+static LOST_FLIPS: AtomicU32 = AtomicU32::new(0);
+static OUT_AMBIGUOUS: AtomicU32 = AtomicU32::new(0);
+
+/// Diagnostics: bulk / interrupt OUT packets whose RX auto-toggle flip the controller lost
+/// (detected and corrected), and those taken as new without a usable TOG_OK (IS_NAK set).
+pub fn lost_toggle_flips() -> (u32, u32) {
+    (LOST_FLIPS.load(Ordering::Relaxed), OUT_AMBIGUOUS.load(Ordering::Relaxed))
 }
 
 /// Isochronous OUT arrivals, by the slot's first word: the endpoint's slot gets `ISO_OUT_MARK`
@@ -653,18 +743,44 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
             r.int_fg().write(|w| w.set_hst_sof(true));
         }
 
-        if flag.transfer() {
-            // INT_ST shows a token as soon as it arrives, not when its transaction completes:
-            // an entry that runs late (the next transaction is already on the bus) reads a
-            // token that hasn't completed
+        // the steps of this branch and why they come in this order: README.md section 3
+        if flag.transfer() && flag.bus_rst() {
+            // a completion from before the reset (it survives it, as do the endpoint
+            // registers): nothing from the old session may be delivered
+            r.int_fg().write(|w| w.set_transfer(true));
+        } else if flag.transfer() {
+            // INT_BUSY NAKs everything while the flag is pending, so INT_ST's endpoint/token and
+            // RX_LEN describe the transaction that raised it, however late this entry runs. The
+            // SIE may still be busy: sending that transaction's handshake (the flag comes ~1.5
+            // us before it ends at full speed), or NAKing another token.
             let mut busy = !r.mis_st().read().sie_free();
             let mut st = r.int_st().read();
             let mut len = r.rx_len().read();
-            if !busy || (st.token() != UsbToken::SOF && st.endp() != 0) {
-                nak_non_iso(d, st);
-            }
-            // release early: INT_ST / RX_LEN are read
+            // NAK the completed direction (bulk / interrupt / control; nothing for iso, SOF,
+            // SETUP), then release at once: the whole bus is NAKed until then (README.md section 3)
+            nak_non_iso(d, st);
             r.int_fg().write(|w| w.set_transfer(true));
+            let non_iso = match st.token() {
+                UsbToken::OUT => !OUT_STATE[st.endp() as usize].iso.load(Ordering::Relaxed),
+                UsbToken::IN => !IN_STATE[st.endp() as usize].iso.load(Ordering::Relaxed),
+                _ => false,
+            };
+            if non_iso {
+                // this entry is that transaction's own, complete: no waiting, no re-reading
+                // after the release (an IN completing by then resets RX_LEN, another
+                // endpoint's OUT sets it)
+                busy = false;
+            }
+            // bulk / interrupt: the completed direction is NAKed, its toggle no longer moves
+            let accepted = if non_iso && st.endp() != 0 {
+                let e = st.endp() as usize;
+                Some(match st.token() {
+                    UsbToken::OUT => out_accepted(d, e, st),
+                    _ => toggled(d, e, Direction::In),
+                })
+            } else {
+                None
+            };
             // an iso OUT on the bus: this entry is its own (raised a little before the SIE goes
             // free) or a late one. take it here once it's in -- left to a later entry, the next
             // microframe's OUT may land on it first. its completion after the release sets
@@ -685,26 +801,6 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                 }
                 busy = false;
                 out_late = true;
-            } else if busy
-                && st.endp() != 0
-                && match st.token() {
-                    UsbToken::OUT => true, // iso: above
-                    UsbToken::IN => !IN_STATE[st.endp() as usize].iso.load(Ordering::Relaxed),
-                    _ => false,
-                }
-            {
-                // bulk / interrupt raise their flag before the SIE goes free too: this may be the
-                // shown transaction's own entry (`toggled` tells). an OUT completing after the
-                // release sets RX_LEN again
-                let mut n = 0;
-                while !r.mis_st().read().sie_free() && n < SIE_WAIT {
-                    n += 1;
-                }
-                busy = false;
-                let now = r.rx_len().read();
-                if now != 0 {
-                    len = now;
-                }
             } else if busy && r.mis_st().read().sie_free() && !r.int_fg().read().transfer() {
                 // it completed before the release, which took its flag (and RX_LEN): handle it
                 // here
@@ -756,8 +852,15 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     UsbToken::OUT if iso => {}
                     // no new packet (a retransmit after a lost ACK, or one NAKed): the endpoint
                     // stays as it is
-                    UsbToken::OUT if ep != 0 && !toggled(r, d, ep, Direction::Out) => {}
-                    UsbToken::OUT if ep == 0 && !st.tog_ok() => {}
+                    UsbToken::OUT if ep != 0 && accepted == Some(false) => {}
+                    // EP0 has no auto-toggle: TOG_OK, but only while IS_NAK is clear (otherwise
+                    // it describes a later, NAKed OUT and this packet is taken as new). A
+                    // duplicate (the host missed our ACK) is dropped and EP0 re-armed
+                    UsbToken::OUT if ep == 0 && !st.is_nak() && !st.tog_ok() => {
+                        if OUT_STATE[0].armed.load(Ordering::Relaxed) {
+                            d.ep_rx_ctrl(0).modify(|w| w.set_mask_uep_r_res(EpRxResponse::ACK));
+                        }
+                    }
                     UsbToken::OUT => {
                         let s = &OUT_STATE[ep];
                         if ep == 0 {
@@ -775,7 +878,7 @@ impl<T: Instance> interrupt::typelevel::Handler<T::Interrupt> for InterruptHandl
                     UsbToken::IN if iso && ISO_IN_PACED.load(Ordering::Relaxed) & 1 << ep != 0 => {}
                     UsbToken::IN if iso && !first_in_frame(&IN_STATE[ep], frame) => {}
                     UsbToken::IN if iso => iso_in_complete(d, ep),
-                    UsbToken::IN if ep != 0 && !toggled(r, d, ep, Direction::In) => {}
+                    UsbToken::IN if ep != 0 && accepted == Some(false) => {}
                     UsbToken::IN => {
                         let s = &IN_STATE[ep];
                         if ep == 0 {
